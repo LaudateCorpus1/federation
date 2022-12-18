@@ -56,6 +56,62 @@ export function extractGraphQLErrorOptions(e: GraphQLError): GraphQLErrorOptions
   };
 }
 
+class AggregateGraphQLError extends GraphQLError {
+  constructor(
+    code: String,
+    message: string,
+    readonly causes: GraphQLError[],
+    options?: GraphQLErrorOptions,
+  ) {
+    super(
+      message + '. Caused by:\n' + causes.map((c) => c.toString()).join('\n\n'),
+      {
+        ...options,
+        extensions: { code },
+      }
+    );
+  }
+
+  toString() {
+    let output = `[${this.extensions.code}] ${super.toString()}`
+    output += "\ncaused by:";
+    for (const cause of this.causes) {
+      output += "\n\n  - ";
+      output += cause.toString().split("\n").join("\n    ");
+    }
+    return output;
+  }
+}
+
+export function aggregateError(code: String, message: string, causes: GraphQLError[]): GraphQLError {
+  return new AggregateGraphQLError(code, message, causes);
+}
+
+/**
+ * Given an error, check if it is a graphQL error and potentially extract its causes if is aggregate.
+ * If the error is not a graphQL error, undefined is returned.
+ */
+export function errorCauses(e: Error): GraphQLError[] | undefined {
+  if (e instanceof AggregateGraphQLError) {
+    return e.causes;
+  }
+  if (e instanceof GraphQLError) {
+    return [e];
+  }
+  return undefined;
+}
+
+export function printGraphQLErrorsOrRethrow(e: Error): string {
+  const causes = errorCauses(e);
+  if (!causes) {
+    throw e;
+  }
+  return causes.map(e => e.toString()).join('\n\n');
+}
+
+export function printErrors(errors: GraphQLError[]): string {
+  return errors.map(e => e.toString()).join('\n\n');
+}
 /*
  * Most codes currently originate from the initial fed 2 release so we use this for convenience.
  * This can be changed later, inline versions everywhere, if that becomes irrelevant.
@@ -144,6 +200,11 @@ const TYPE_DEFINITION_INVALID = makeCodeDefinition(
   'A built-in or federation type has an invalid definition in the schema.',
 );
 
+const UNSUPPORTED_LINKED_FEATURE = makeCodeDefinition(
+  'UNSUPPORTED_LINKED_FEATURE',
+  'Indicates that a feature used in a @link is either unsupported or is used with unsupported options.',
+);
+
 const UNKNOWN_FEDERATION_LINK_VERSION = makeCodeDefinition(
   'UNKNOWN_FEDERATION_LINK_VERSION',
   'The version of federation in a @link directive on the schema is unknown.',
@@ -162,7 +223,6 @@ const FIELDS_HAS_ARGS = makeFederationDirectiveErrorCodeCategory(
 
 const KEY_FIELDS_HAS_ARGS = FIELDS_HAS_ARGS.createCode('key');
 const PROVIDES_FIELDS_HAS_ARGS = FIELDS_HAS_ARGS.createCode('provides');
-const REQUIRES_FIELDS_HAS_ARGS = FIELDS_HAS_ARGS.createCode('requires');
 
 const DIRECTIVE_FIELDS_MISSING_EXTERNAL = makeFederationDirectiveErrorCodeCategory(
   'FIELDS_MISSING_EXTERNAL',
@@ -175,7 +235,7 @@ const REQUIRES_MISSING_EXTERNAL = DIRECTIVE_FIELDS_MISSING_EXTERNAL.createCode('
 
 const DIRECTIVE_UNSUPPORTED_ON_INTERFACE = makeFederationDirectiveErrorCodeCategory(
   'UNSUPPORTED_ON_INTERFACE',
-  (directive) => `A \`@${directive}\` directive is used on an interface, which is not (yet) supported.`,
+  (directive) => `A \`@${directive}\` directive is used on an interface, which is ${directive === 'key' ? 'only supported when @linking to federation 2.3+' : 'not (yet) supported'}.`,
 );
 
 const KEY_UNSUPPORTED_ON_INTERFACE = DIRECTIVE_UNSUPPORTED_ON_INTERFACE.createCode('key');
@@ -335,14 +395,15 @@ const EXTERNAL_MISSING_ON_BASE = makeCodeDefinition(
   { addedIn: FED1_CODE },
 );
 
-const INTERFACE_FIELD_IMPLEM_TYPE_MISMATCH = makeCodeDefinition(
-  'INTERFACE_FIELD_IMPLEM_TYPE_MISMATCH',
-  'For an interface field, some of its concrete implementations have @external or @requires and there is difference in those implementations return type (which is currently not supported; see https://github.com/apollographql/federation/issues/1257)'
-);
-
 const INVALID_FIELD_SHARING = makeCodeDefinition(
   'INVALID_FIELD_SHARING',
   'A field that is non-shareable in at least one subgraph is resolved by multiple subgraphs.'
+);
+
+const INVALID_SHAREABLE_USAGE = makeCodeDefinition(
+  'INVALID_SHAREABLE_USAGE',
+  'The `@shareable` federation directive is used in an invalid way.',
+  { addedIn: '2.1.2' },
 );
 
 const INVALID_LINK_DIRECTIVE_USAGE = makeCodeDefinition(
@@ -459,6 +520,31 @@ const DOWNSTREAM_SERVICE_ERROR = makeCodeDefinition(
   { addedIn: FED1_CODE },
 );
 
+const DIRECTIVE_COMPOSITION_ERROR = makeCodeDefinition(
+  'DIRECTIVE_COMPOSITION_ERROR',
+  'Error when composing custom directives.',
+  { addedIn: '2.1.0' },
+);
+
+const INTERFACE_OBJECT_USAGE_ERROR = makeCodeDefinition(
+  'INTERFACE_OBJECT_USAGE_ERROR',
+  'Error in the usage of the @interfaceObject directive.',
+  { addedIn: '2.3.0' },
+);
+
+const INTERFACE_KEY_NOT_ON_IMPLEMENTATION = makeCodeDefinition(
+  'INTERFACE_KEY_NOT_ON_IMPLEMENTATION',
+  'A `@key` is defined on an interface type, but is not defined (or is not resolvable) on at least one of the interface implementations',
+  { addedIn: '2.3.0' },
+);
+
+const INTERFACE_KEY_MISSING_IMPLEMENTATION_TYPE = makeCodeDefinition(
+  'INTERFACE_KEY_MISSING_IMPLEMENTATION_TYPE',
+  'A subgraph has a `@key` on an interface type, but that subgraph does not define an implementation (in the supergraph) of that interface',
+  { addedIn: '2.3.0' },
+)
+
+
 export const ERROR_CATEGORIES = {
   DIRECTIVE_FIELDS_MISSING_EXTERNAL,
   DIRECTIVE_UNSUPPORTED_ON_INTERFACE,
@@ -473,11 +559,11 @@ export const ERRORS = {
   INVALID_GRAPHQL,
   DIRECTIVE_DEFINITION_INVALID,
   TYPE_DEFINITION_INVALID,
+  UNSUPPORTED_LINKED_FEATURE,
   UNKNOWN_FEDERATION_LINK_VERSION,
   UNKNOWN_LINK_VERSION,
   KEY_FIELDS_HAS_ARGS,
   PROVIDES_FIELDS_HAS_ARGS,
-  REQUIRES_FIELDS_HAS_ARGS,
   PROVIDES_MISSING_EXTERNAL,
   REQUIRES_MISSING_EXTERNAL,
   KEY_UNSUPPORTED_ON_INTERFACE,
@@ -513,8 +599,8 @@ export const ERRORS = {
   ARGUMENT_DEFAULT_MISMATCH,
   EXTENSION_WITH_NO_BASE,
   EXTERNAL_MISSING_ON_BASE,
-  INTERFACE_FIELD_IMPLEM_TYPE_MISMATCH,
   INVALID_FIELD_SHARING,
+  INVALID_SHAREABLE_USAGE,
   INVALID_LINK_DIRECTIVE_USAGE,
   INVALID_LINK_IDENTIFIER,
   LINK_IMPORT_NAME_MISMATCH,
@@ -540,6 +626,10 @@ export const ERRORS = {
   KEY_HAS_DIRECTIVE_IN_FIELDS_ARGS,
   PROVIDES_HAS_DIRECTIVE_IN_FIELDS_ARGS,
   REQUIRES_HAS_DIRECTIVE_IN_FIELDS_ARGS,
+  DIRECTIVE_COMPOSITION_ERROR,
+  INTERFACE_OBJECT_USAGE_ERROR,
+  INTERFACE_KEY_NOT_ON_IMPLEMENTATION,
+  INTERFACE_KEY_MISSING_IMPLEMENTATION_TYPE,
 };
 
 const codeDefByCode = Object.values(ERRORS).reduce((obj: {[code: string]: ErrorCodeDefinition}, codeDef: ErrorCodeDefinition) => { obj[codeDef.code] = codeDef; return obj; }, {});
@@ -564,15 +654,18 @@ export const REMOVED_ERRORS = [
   ['REQUIRES_FIELDS_MISSING_ON_BASE', 'Fields in @requires can now be from any subgraph.'],
   ['REQUIRES_USED_ON_BASE', 'As there is not type ownership anymore, there is also no particular limitation as to which subgraph can use a @requires.'],
 
-  ['DUPLICATE_SCALAR_DEFINITION', 'As duplicate scalar definitions is invalid GraphQL, this will now be an error with code `INVALID_GRAPHQL`'],
-  ['DUPLICATE_ENUM_DEFINITION', 'As duplicate enum definitions is invalid GraphQL, this will now be an error with code `INVALID_GRAPHQL`'],
-  ['DUPLICATE_ENUM_VALUE', 'As duplicate enum values is invalid GraphQL, this will now be an error with code `INVALID_GRAPHQL`'],
+  ['DUPLICATE_SCALAR_DEFINITION', 'As duplicate scalar definitions is invalid GraphQL, this will now be an error with code `INVALID_GRAPHQL`.'],
+  ['DUPLICATE_ENUM_DEFINITION', 'As duplicate enum definitions is invalid GraphQL, this will now be an error with code `INVALID_GRAPHQL`.'],
+  ['DUPLICATE_ENUM_VALUE', 'As duplicate enum values is invalid GraphQL, this will now be an error with code `INVALID_GRAPHQL`.'],
 
-  ['ENUM_MISMATCH', 'Subgraph definitions for an enum are now merged by composition'],
+  ['ENUM_MISMATCH', 'Subgraph definitions for an enum are now merged by composition.'],
   ['VALUE_TYPE_NO_ENTITY', 'There is no strong different between entity and value types in the model (they are just usage pattern) and a type can have keys in one subgraph but not another.'],
-  ['VALUE_TYPE_UNION_TYPES_MISMATCH', 'Subgraph definitions for an union are now merged by composition'],
-  ['PROVIDES_FIELDS_SELECT_INVALID_TYPE', '@provides can now be used on field of interface, union and list types'],
-  ['RESERVED_FIELD_USED', 'This error was previously not correctly enforced: the _service and _entities, if present, were overridden; this is still the case'],
+  ['VALUE_TYPE_UNION_TYPES_MISMATCH', 'Subgraph definitions for an union are now merged by composition.'],
+  ['PROVIDES_FIELDS_SELECT_INVALID_TYPE', '@provides can now be used on field of interface, union and list types.'],
+  ['RESERVED_FIELD_USED', 'This error was previously not correctly enforced: the _service and _entities, if present, were overridden; this is still the case.'],
 
-  ['NON_REPEATABLE_DIRECTIVE_ARGUMENTS_MISMATCH', 'Since federation 2.1.0, the case this error used to cover is now a warning (with code `INCONSISTENT_NON_REPEATABLE_DIRECTIVE_ARGUMENTS`) instead of an error'],
+  ['NON_REPEATABLE_DIRECTIVE_ARGUMENTS_MISMATCH', 'Since federation 2.1.0, the case this error used to cover is now a warning (with code `INCONSISTENT_NON_REPEATABLE_DIRECTIVE_ARGUMENTS`) instead of an error.'],
+  ['REQUIRES_FIELDS_HAS_ARGS', 'Since federation 2.1.1, using fields with arguments in a @requires is fully supported.'],
+
+  ['INTERFACE_FIELD_IMPLEM_TYPE_MISMATCH', 'This error was thrown by a validation introduced to avoid running into a known runtime bug. Since federation 2.3, the underlying runtime bug has been addressed and the validation/limitation was no longer necessary and has been removed.'],
 ];

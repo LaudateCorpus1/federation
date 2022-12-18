@@ -1,34 +1,9 @@
 import { DocumentNode } from 'graphql';
 import gql from 'graphql-tag';
 import { Subgraph } from '..';
-import { errorCauses } from '../definitions';
-import { asFed2SubgraphDocument, buildSubgraph } from "../federation"
+import { buildSubgraph } from "../federation"
 import { defaultPrintOptions, printSchema } from '../print';
-import './matchers';
-
-// Builds the provided subgraph (using name 'S' for the subgraph) and, if the
-// subgraph is invalid/has errors, return those errors as a list of [code, message].
-// If the subgraph is valid, return undefined.
-export function buildForErrors(
-  subgraphDefs: DocumentNode,
-  options?: {
-    subgraphName?: string,
-    asFed2?: boolean,
-  }
-): [string, string][] | undefined {
-  try {
-    const doc = (options?.asFed2 ?? true) ? asFed2SubgraphDocument(subgraphDefs) : subgraphDefs;
-    const name = options?.subgraphName ?? 'S';
-    buildSubgraph(name, `http://${name}`, doc).validate();
-    return undefined;
-  } catch (e) {
-    const causes = errorCauses(e);
-    if (!causes) {
-      throw e;
-    }
-    return causes.map((err) => [err.extensions.code as string, err.message]);
-  }
-}
+import { buildForErrors } from './testUtils';
 
 describe('fieldset-based directives', () => {
   it('rejects field defined with arguments in @key', () => {
@@ -58,22 +33,6 @@ describe('fieldset-based directives', () => {
     `
     expect(buildForErrors(subgraph)).toStrictEqual([
       ['PROVIDES_FIELDS_HAS_ARGS', '[S] On field "Query.t", for @provides(fields: "f"): field T.f cannot be included because it has arguments (fields with argument are not allowed in @provides)']
-    ]);
-  });
-
-  it('rejects field defined with arguments in @requires', () => {
-    const subgraph =  gql`
-      type Query {
-        t: T
-      }
-
-      type T {
-        f(x: Int): Int @external
-        g: Int @requires(fields: "f")
-      }
-    `
-    expect(buildForErrors(subgraph)).toStrictEqual([
-      ['REQUIRES_FIELDS_HAS_ARGS', '[S] On field "T.g", for @requires(fields: "f"): field T.f cannot be included because it has arguments (fields with argument are not allowed in @requires)']
     ]);
   });
 
@@ -108,8 +67,11 @@ describe('fieldset-based directives', () => {
     ]);
   });
 
-  it('rejects @key on interfaces', () => {
+  it.each(['2.0', '2.1', '2.2'])('rejects @key on interfaces _in the %p spec_', (version) => {
     const subgraph =  gql`
+      extend schema
+        @link(url: "https://specs.apollo.dev/federation/v${version}", import: ["@key"])
+
       type Query {
         t: T
       }
@@ -118,7 +80,7 @@ describe('fieldset-based directives', () => {
         f: Int
       }
     `
-    expect(buildForErrors(subgraph)).toStrictEqual([
+    expect(buildForErrors(subgraph, { asFed2: false })).toStrictEqual([
       ['KEY_UNSUPPORTED_ON_INTERFACE', '[S] Cannot use @key on interface "T": @key is not yet supported on interfaces'],
     ]);
   });
@@ -460,6 +422,61 @@ describe('fieldset-based directives', () => {
       ['PROVIDES_FIELDS_MISSING_EXTERNAL', '[S] On field "Query.t", for @provides(fields: "f(x: 3)"): field "T.f" should not be part of a @provides since it is already provided by this subgraph (it is not marked @external)'],
     ]);
   });
+
+  it('rejects aliases in @key', () => {
+    const subgraph =  gql`
+      type Query {
+        t: T
+      }
+
+      type T @key(fields: "foo: id") {
+        id: ID!
+      }
+    `
+    expect(buildForErrors(subgraph)).toStrictEqual([
+      [ 'KEY_INVALID_FIELDS', '[S] On type "T", for @key(fields: "foo: id"): Cannot use alias "foo" in "foo: id": aliases are not currently supported in @key' ],
+    ]);
+  });
+
+  it('rejects aliases in @provides', () => {
+    const subgraph =  gql`
+      type Query {
+        t: T @provides(fields: "bar: x")
+      }
+
+      type T @key(fields: "id") {
+        id: ID!
+        x: Int @external
+      }
+    `
+    expect(buildForErrors(subgraph)).toStrictEqual([
+      [ 'PROVIDES_INVALID_FIELDS', '[S] On field "Query.t", for @provides(fields: "bar: x"): Cannot use alias "bar" in "bar: x": aliases are not currently supported in @provides' ],
+    ]);
+  });
+
+  it('rejects aliases in @requires', () => {
+    const subgraph =  gql`
+      type Query {
+        t: T
+      }
+
+      type T {
+        x: X @external
+        y: Int @external
+        g: Int @requires(fields: "foo: y")
+        h: Int @requires(fields: "x { m: a n: b }")
+      }
+
+      type X {
+        a: Int
+        b: Int
+      }
+    `
+    expect(buildForErrors(subgraph)).toStrictEqual([
+      [ 'REQUIRES_INVALID_FIELDS', '[S] On field "T.g", for @requires(fields: "foo: y"): Cannot use alias "foo" in "foo: y": aliases are not currently supported in @requires' ],
+      [ 'REQUIRES_INVALID_FIELDS', '[S] On field "T.h", for @requires(fields: "x { m: a n: b }"): Cannot use alias "m" in "m: a": aliases are not currently supported in @requires' ],
+    ]);
+  });
 });
 
 describe('root types', () => {
@@ -520,34 +537,6 @@ describe('root types', () => {
     ]);
   });
 });
-
-it('validates all implementations of interface field have same type if any has @external', () => {
-  const subgraph = gql`
-    type Query {
-      is: [I!]!
-    }
-
-    interface I {
-      f: Int
-    }
-
-    type T1 implements I {
-      f: Int
-    }
-
-    type T2 implements I {
-      f: Int!
-    }
-
-    type T3 implements I {
-      id: ID!
-      f: Int @external
-    }
-  `;
-    expect(buildForErrors(subgraph)).toStrictEqual([
-      ['INTERFACE_FIELD_IMPLEM_TYPE_MISMATCH', '[S] Some of the runtime implementations of interface field "I.f" are marked @external or have a @require ("T3.f") so all the implementations should use the same type (a current limitation of federation; see https://github.com/apollographql/federation/issues/1257), but "T1.f" and "T3.f" have type "Int" while "T2.f" has type "Int!".'],
-    ]);
-})
 
 describe('custom error message for misnamed directives', () => {
   it.each([
@@ -1086,3 +1075,180 @@ describe('federation 1 schema', () => {
     ]]);
   });
 })
+
+describe('@shareable', () => {
+  it('can only be applied to fields of object types', () => {
+    const doc = gql`
+      interface I {
+        a: Int @shareable
+      }
+    `;
+
+    expect(buildForErrors(doc)).toStrictEqual([[
+      'INVALID_SHAREABLE_USAGE',
+      '[S] Invalid use of @shareable on field "I.a": only object type fields can be marked with @shareable'
+    ]]);
+  });
+
+  it('rejects duplicate @shareable on the same definition declaration', () => {
+    const doc = gql`
+      type E @shareable @key(fields: "id") @shareable {
+        id: ID!
+        a: Int
+      }
+    `;
+
+    expect(buildForErrors(doc)).toStrictEqual([[
+      'INVALID_SHAREABLE_USAGE',
+      '[S] Invalid duplicate application of @shareable on the same type declaration of "E": @shareable is only repeatable on types so it can be used simultaneously on a type definition and its extensions, but it should not be duplicated on the same definition/extension declaration'
+    ]]);
+  });
+
+  it('rejects duplicate @shareable on the same extension declaration', () => {
+    const doc = gql`
+      type E @shareable {
+        id: ID!
+        a: Int
+      }
+
+      extend type E @shareable @shareable {
+        b: Int
+      }
+    `;
+    expect(buildForErrors(doc)).toStrictEqual([[
+      'INVALID_SHAREABLE_USAGE',
+      '[S] Invalid duplicate application of @shareable on the same type declaration of "E": @shareable is only repeatable on types so it can be used simultaneously on a type definition and its extensions, but it should not be duplicated on the same definition/extension declaration'
+    ]]);
+  });
+
+  it('rejects duplicate @shareable on a field', () => {
+    const doc = gql`
+      type E {
+        a: Int @shareable @shareable
+      }
+    `;
+
+    expect(buildForErrors(doc)).toStrictEqual([[
+      'INVALID_SHAREABLE_USAGE',
+      '[S] Invalid duplicate application of @shareable on field "E.a": @shareable is only repeatable on types so it can be used simultaneously on a type definition and its extensions, but it should not be duplicated on the same definition/extension declaration'
+    ]]);
+  });
+});
+
+describe('@interfaceObject/@key on interfaces validation', () => {
+  it('@key on interfaces require @key on all implementations', () => {
+    const doc = gql`
+      interface I @key(fields: "id1") @key(fields: "id2") {
+        id1: ID!
+        id2: ID!
+      }
+
+      type A implements I @key(fields: "id2") {
+        id1: ID!
+        id2: ID!
+        a: Int
+      }
+
+      type B implements I @key(fields: "id1") @key(fields: "id2") {
+        id1: ID!
+        id2: ID!
+        b: Int
+      }
+
+      type C implements I @key(fields: "id2") {
+        id1: ID!
+        id2: ID!
+        c: Int
+      }
+    `;
+
+    expect(buildForErrors(doc)).toStrictEqual([[
+      'INTERFACE_KEY_NOT_ON_IMPLEMENTATION',
+      '[S] Key @key(fields: "id1") on interface type "I" is missing on implementation types "A" and "C".',
+    ]]);
+  });
+
+  it('@key on interfaces with @key on some implementation non resolvable', () => {
+    const doc = gql`
+      interface I @key(fields: "id1") {
+        id1: ID!
+      }
+
+      type A implements I @key(fields: "id1") {
+        id1: ID!
+        a: Int
+      }
+
+      type B implements I @key(fields: "id1") {
+        id1: ID!
+        b: Int
+      }
+
+      type C implements I @key(fields: "id1", resolvable: false) {
+        id1: ID!
+        c: Int
+      }
+    `;
+
+    expect(buildForErrors(doc)).toStrictEqual([[
+      'INTERFACE_KEY_NOT_ON_IMPLEMENTATION',
+      '[S] Key @key(fields: "id1") on interface type "I" should be resolvable on all implementation types, but is declared with argument "@key(resolvable:)" set to false in type "C".',
+    ]]);
+  });
+
+  it('ensures order of fields in key does not matter', () => {
+    const doc = gql`
+      interface I @key(fields: "a b c") {
+        a: Int
+        b: Int
+        c: Int
+      }
+
+      type A implements I @key(fields: "c b a") {
+        a: Int
+        b: Int
+        c: Int
+      }
+
+      type B implements I @key(fields: "a c b") {
+        a: Int
+        b: Int
+        c: Int
+      }
+
+      type C implements I @key(fields: "a b c") {
+        a: Int
+        b: Int
+        c: Int
+      }
+    `;
+
+    expect(buildForErrors(doc)).toBeUndefined();
+  });
+
+  // There is no meaningful way to make @interfaceObject work on a value type at the moment, because
+  // if you have an @interfaceObject, some other subgraph needs to be able to resolve the concrete
+  // type, and that imply that you have key to go to that other subgraph.
+  // To be clear, the @key on the @interfaceObject technically con't need to be "resolvable", and the
+  // difference between no key and a non-resolvable key is arguably more convention than a genuine 
+  // mechanical difference at the moment, but still a good idea to rely on that convention to help
+  // catching obvious mistakes early.
+  it('only allow @interfaceObject on entity types', () => {
+    const doc = gql`
+      # This one shouldn't raise an error
+      type A @key(fields: "id", resolvable: false) @interfaceObject {
+        id: ID!
+      }
+
+      # This one should
+      type B @interfaceObject {
+        x: Int
+      }
+    `;
+
+    expect(buildForErrors(doc)).toStrictEqual([[
+      'INTERFACE_OBJECT_USAGE_ERROR',
+      '[S] The @interfaceObject directive can only be applied to entity types but type "B" has no @key in this subgraph.'
+    ]]);
+  });
+});

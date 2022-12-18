@@ -1,93 +1,159 @@
-import { astSerializer, queryPlanSerializer, QueryPlanner } from '@apollo/query-planner';
-import { composeServices } from '@apollo/composition';
-import { asFed2SubgraphDocument, assert, buildSchema, operationFromDocument, Schema, ServiceDefinition } from '@apollo/federation-internals';
+import { QueryPlanner } from '@apollo/query-planner';
+import { assert, buildSchema, operationFromDocument, ServiceDefinition } from '@apollo/federation-internals';
 import gql from 'graphql-tag';
 import { MAX_COMPUTED_PLANS } from '../buildPlan';
 import { FetchNode, FlattenNode, SequenceNode } from '../QueryPlan';
 import { FieldNode, OperationDefinitionNode, parse } from 'graphql';
-import { QueryPlannerConfig } from '../config';
+import { composeAndCreatePlanner, composeAndCreatePlannerWithOptions } from './testHelper';
 
-expect.addSnapshotSerializer(astSerializer);
-expect.addSnapshotSerializer(queryPlanSerializer);
+describe('shareable root fields', () => {
+  test('can use same root operation from multiple subgraphs in parallel', () => {
+    const subgraph1 = {
+      name: 'Subgraph1',
+      typeDefs: gql`
+        type Query {
+          me: User! @shareable
+        }
 
-function composeAndCreatePlanner(...services: ServiceDefinition[]): [Schema, QueryPlanner] {
-  return composeAndCreatePlannerWithOptions(services, {});
-}
-
-function composeAndCreatePlannerWithOptions(services: ServiceDefinition[], config: QueryPlannerConfig): [Schema, QueryPlanner] {
-  const compositionResults = composeServices(
-    services.map((s) => ({ ...s, typeDefs: asFed2SubgraphDocument(s.typeDefs) }))
-  );
-  expect(compositionResults.errors).toBeUndefined();
-  return [
-    compositionResults.schema!.toAPISchema(),
-    new QueryPlanner(buildSchema(compositionResults.supergraphSdl!), config)
-  ];
-}
-
-test('can use same root operation from multiple subgraphs in parallel', () => {
-  const subgraph1 = {
-    name: 'Subgraph1',
-    typeDefs: gql`
-      type Query {
-        me: User! @shareable
-      }
-
-      type User @key(fields: "id") {
-        id: ID!
-        prop1: String
-      }
-    `
-  }
-
-  const subgraph2 = {
-    name: 'Subgraph2',
-    typeDefs: gql`
-      type Query {
-        me: User! @shareable
-      }
-
-      type User @key(fields: "id") {
-        id: ID!
-        prop2: String
-      }
-    `
-  }
-
-  const [api, queryPlanner] = composeAndCreatePlanner(subgraph1, subgraph2);
-  const operation = operationFromDocument(api, gql`
-    {
-      me {
-        prop1
-        prop2
-      }
+        type User @key(fields: "id") {
+          id: ID!
+          prop1: String
+        }
+      `
     }
-  `);
 
-  const plan = queryPlanner.buildQueryPlan(operation);
-  // Note that even though we have keys, it is faster to query both
-  // subgraphs in parallel for each property than querying one first
-  // and then using the key.
-  expect(plan).toMatchInlineSnapshot(`
-    QueryPlan {
-      Parallel {
-        Fetch(service: "Subgraph1") {
-          {
-            me {
-              prop1
-            }
-          }
-        },
-        Fetch(service: "Subgraph2") {
-          {
-            me {
-              prop2
-            }
-          }
-        },
-      },
+    const subgraph2 = {
+      name: 'Subgraph2',
+      typeDefs: gql`
+        type Query {
+          me: User! @shareable
+        }
+
+        type User @key(fields: "id") {
+          id: ID!
+          prop2: String
+        }
+      `
     }
-  `);
+
+    const [api, queryPlanner] = composeAndCreatePlanner(subgraph1, subgraph2);
+    const operation = operationFromDocument(api, gql`
+      {
+        me {
+          prop1
+          prop2
+        }
+      }
+    `);
+
+    const plan = queryPlanner.buildQueryPlan(operation);
+    // Note that even though we have keys, it is faster to query both
+    // subgraphs in parallel for each property than querying one first
+    // and then using the key.
+    expect(plan).toMatchInlineSnapshot(`
+      QueryPlan {
+        Parallel {
+          Fetch(service: "Subgraph1") {
+            {
+              me {
+                prop1
+              }
+            }
+          },
+          Fetch(service: "Subgraph2") {
+            {
+              me {
+                prop2
+              }
+            }
+          },
+        },
+      }
+    `);
+  });
+
+  test('handles root operation shareable in many subgraphs', () => {
+    const fieldCount = 4;
+    const fields = [...Array(fieldCount).keys()].map((i) => `f${i}`);
+    const subgraph1 = {
+      name: 'Subgraph1',
+      typeDefs: gql`
+        type User @key(fields: "id") {
+          id: ID!
+          ${fields.map((f) => `${f}: Int\n`)}
+        }
+      `
+    }
+
+    const subgraph2 = {
+      name: 'Subgraph2',
+      typeDefs: gql`
+        type Query {
+          me: User! @shareable
+        }
+
+        type User @key(fields: "id") {
+          id: ID!
+        }
+      `
+    }
+
+    const subgraph3 = {
+      name: 'Subgraph3',
+      typeDefs: gql`
+        type Query {
+          me: User! @shareable
+        }
+
+        type User @key(fields: "id") {
+          id: ID!
+        }
+      `
+    }
+
+    const [api, queryPlanner] = composeAndCreatePlanner(subgraph1, subgraph2, subgraph3);
+    const operation = operationFromDocument(api, gql`
+      {
+        me {
+          ${fields.map((f) => `${f}\n`)}
+        }
+      }
+    `);
+
+    const plan = queryPlanner.buildQueryPlan(operation);
+    expect(plan).toMatchInlineSnapshot(`
+      QueryPlan {
+        Sequence {
+          Fetch(service: "Subgraph2") {
+            {
+              me {
+                __typename
+                id
+              }
+            }
+          },
+          Flatten(path: "me") {
+            Fetch(service: "Subgraph1") {
+              {
+                ... on User {
+                  __typename
+                  id
+                }
+              } =>
+              {
+                ... on User {
+                  f0
+                  f1
+                  f2
+                  f3
+                }
+              }
+            },
+          },
+        },
+      }
+    `);
+  });
 });
 
 test('pick keys that minimize fetches', () => {
@@ -950,6 +1016,180 @@ describe('@provides', () => {
       }
       `);
   });
+
+  it('works with type-condition, even for types only reachable by the @provides', () => {
+    const subgraph1 = {
+      name: 'Subgraph1',
+      typeDefs: gql`
+        type Query {
+          noProvides: E
+          withProvides: E @provides(fields: "i { a ... on T1 { b } }")
+        }
+
+        type E @key(fields: "id") {
+          id: ID!
+          i: I @external
+        }
+
+        interface I {
+          a: Int
+        }
+
+        type T1 implements I @key(fields: "id") {
+          id: ID!
+          a: Int @external
+          b: Int @external
+        }
+
+        type T2 implements I @key(fields: "id") {
+          id: ID!
+          a: Int @external
+        }
+      `
+    }
+
+    const subgraph2 = {
+      name: 'Subgraph2',
+      typeDefs: gql`
+        type E @key(fields: "id") {
+          id: ID!
+          i: I @shareable
+        }
+
+        interface I {
+          a: Int
+        }
+
+        type T1 implements I @key(fields: "id") {
+          id: ID!
+          a: Int @shareable
+          b: Int @shareable
+        }
+
+        type T2 implements I @key(fields: "id") {
+          id: ID!
+          a: Int @shareable
+          c: Int
+        }
+      `
+    }
+
+    let [api, queryPlanner] = composeAndCreatePlanner(subgraph1, subgraph2);
+    let operation = operationFromDocument(api, gql`
+      {
+        noProvides {
+          i {
+            a
+            ... on T1 {
+              b
+            }
+            ... on T2 {
+              c
+            }
+          }
+        }
+      }
+      `);
+
+    let plan = queryPlanner.buildQueryPlan(operation);
+    // This is our sanity check: we first query _without_ the provides to make sure we _do_ need to
+    // go the the second subgraph for everything.
+    expect(plan).toMatchInlineSnapshot(`
+      QueryPlan {
+        Sequence {
+          Fetch(service: "Subgraph1") {
+            {
+              noProvides {
+                __typename
+                id
+              }
+            }
+          },
+          Flatten(path: "noProvides") {
+            Fetch(service: "Subgraph2") {
+              {
+                ... on E {
+                  __typename
+                  id
+                }
+              } =>
+              {
+                ... on E {
+                  i {
+                    __typename
+                    a
+                    ... on T1 {
+                      b
+                    }
+                    ... on T2 {
+                      c
+                    }
+                  }
+                }
+              }
+            },
+          },
+        },
+      }
+    `);
+
+    // But the same operation with the provides allow to get what is provided from the first subgraph.
+    operation = operationFromDocument(api, gql`
+      {
+        withProvides {
+          i {
+            a
+            ... on T1 {
+              b
+            }
+            ... on T2 {
+              c
+            }
+          }
+        }
+      }
+    `);
+
+    plan = queryPlanner.buildQueryPlan(operation);
+    expect(plan).toMatchInlineSnapshot(`
+      QueryPlan {
+        Sequence {
+          Fetch(service: "Subgraph1") {
+            {
+              withProvides {
+                i {
+                  __typename
+                  a
+                  ... on T1 {
+                    b
+                  }
+                  ... on T2 {
+                    __typename
+                    id
+                  }
+                }
+              }
+            }
+          },
+          Flatten(path: "withProvides.i") {
+            Fetch(service: "Subgraph2") {
+              {
+                ... on T2 {
+                  __typename
+                  id
+                }
+              } =>
+              {
+                ... on T2 {
+                  c
+                }
+              }
+            },
+          },
+        },
+      }
+    `);
+  });
 });
 
 describe('@requires', () => {
@@ -1015,7 +1255,8 @@ describe('@requires', () => {
 
     const plan = queryPlanner.buildQueryPlan(operation);
     // The main goal of this test is to show that the 2 @requires for `f` gets handled seemlessly
-    // into the same fetch group.
+    // into the same fetch group. But note that because the type for `f` differs, the 2nd instance
+    // gets aliased (or the fetch would be invalid graphQL).
     expect(plan).toMatchInlineSnapshot(`
       QueryPlan {
         Sequence {
@@ -1034,7 +1275,7 @@ describe('@requires', () => {
                 ... on T3 {
                   __typename
                   id
-                  f
+                  f__alias_0: f
                 }
               }
             }
@@ -1278,7 +1519,7 @@ describe('@requires', () => {
       }
     `);
 
-    // Ensures that manually asking for the required dependencies doesn't change anything 
+    // Ensures that manually asking for the required dependencies doesn't change anything
     // (note: technically it happens to switch the order of fields in the inputs of "Subgraph2"
     // so the plans are not 100% the same "string", which is why we inline it in both cases,
     // but that's still the same plan and a perfectly valid output).
@@ -2392,6 +2633,82 @@ describe('@requires', () => {
         }
       `);
     });
+  });
+
+  it('can require @inaccessible fields', () => {
+    const subgraph1 = {
+      name: 'Subgraph1',
+      typeDefs: gql`
+        type Query {
+          one: One
+          onlyIn1: Int
+        }
+
+        type One @key(fields: "id") {
+          id: ID!
+          a: String @inaccessible
+          onlyIn1: Int
+        }
+      `
+    }
+
+    const subgraph2 = {
+      name: 'Subgraph2',
+      typeDefs: gql`
+        type Query {
+          onlyIn2: Int
+        }
+
+        type One @key(fields: "id") {
+          id: ID!
+          a: String @external
+          b: String @requires(fields: "a" )
+          onlyIn2: Int
+        }
+      `
+    }
+
+    const [api, queryPlanner] = composeAndCreatePlanner(subgraph1, subgraph2);
+    const operation = operationFromDocument(api, gql`
+      {
+        one {
+          b
+        }
+      }
+    `);
+
+    const plan = queryPlanner.buildQueryPlan(operation);
+    expect(plan).toMatchInlineSnapshot(`
+      QueryPlan {
+        Sequence {
+          Fetch(service: "Subgraph1") {
+            {
+              one {
+                __typename
+                id
+                a
+              }
+            }
+          },
+          Flatten(path: "one") {
+            Fetch(service: "Subgraph2") {
+              {
+                ... on One {
+                  __typename
+                  id
+                  a
+                }
+              } =>
+              {
+                ... on One {
+                  b
+                }
+              }
+            },
+          },
+        },
+      }
+    `);
   });
 });
 
@@ -3550,4 +3867,1450 @@ describe('Named fragments preservation', () => {
 
     expect(plan).toMatchInlineSnapshot(reuseQueryFragments ? withReuse : withoutReuse);
   });
+
+  it('works with nested fragments when only the nested fragment gets preserved', () => {
+    const subgraph1 = {
+      name: 'Subgraph1',
+      typeDefs: gql`
+        type Query {
+          t: T
+        }
+
+        type T @key(fields : "id") {
+          id: ID!
+          a: V
+          b: V
+        }
+
+        type V {
+          v: Int
+        }
+
+      `
+    }
+
+    const [api, queryPlanner] = composeAndCreatePlanner(subgraph1);
+    let operation = operationFromDocument(api, gql`
+      {
+        t {
+          ...OnT
+        }
+      }
+
+      fragment OnT on T {
+        a {
+          ...OnV
+        }
+        b {
+          ...OnV
+        }
+      }
+
+      fragment OnV on V {
+        v
+      }
+    `);
+
+    const plan = queryPlanner.buildQueryPlan(operation);
+    expect(plan).toMatchInlineSnapshot(`
+      QueryPlan {
+        Fetch(service: "Subgraph1") {
+          {
+            t {
+              a {
+                ...OnV
+              }
+              b {
+                ...OnV
+              }
+            }
+          }
+          
+          fragment OnV on V {
+            v
+          }
+        },
+      }
+    `);
+  });
+
+  it('preserves directives when fragment not used (because used only once)', () => {
+    const subgraph1 = {
+      name: 'Subgraph1',
+      typeDefs: gql`
+        type Query {
+          t: T
+        }
+
+        type T @key(fields : "id") {
+          id: ID!
+          a: Int
+          b: Int
+        }
+      `
+    }
+
+    const [api, queryPlanner] = composeAndCreatePlanner(subgraph1);
+    let operation = operationFromDocument(api, gql`
+      query test($if: Boolean) {
+        t {
+          id
+          ...OnT @include(if: $if)
+        }
+      }
+
+      fragment OnT on T {
+        a
+        b
+      }
+    `);
+
+    const plan = queryPlanner.buildQueryPlan(operation);
+    expect(plan).toMatchInlineSnapshot(`
+      QueryPlan {
+        Fetch(service: "Subgraph1") {
+          {
+            t {
+              id
+              ... on T @include(if: $if) {
+                a
+                b
+              }
+            }
+          }
+        },
+      }
+    `);
+  });
+
+  it('preserves directives when fragment is re-used', () => {
+    const subgraph1 = {
+      name: 'Subgraph1',
+      typeDefs: gql`
+        type Query {
+          t: T
+        }
+
+        type T @key(fields : "id") {
+          id: ID!
+          a: Int
+          b: Int
+        }
+      `
+    }
+
+    const [api, queryPlanner] = composeAndCreatePlanner(subgraph1);
+    let operation = operationFromDocument(api, gql`
+      query test($test1: Boolean, $test2: Boolean) {
+        t {
+          id
+          ...OnT @include(if: $test1)
+          ...OnT @include(if: $test2)
+        }
+      }
+
+      fragment OnT on T {
+        a
+        b
+      }
+    `);
+
+    const plan = queryPlanner.buildQueryPlan(operation);
+    expect(plan).toMatchInlineSnapshot(`
+      QueryPlan {
+        Fetch(service: "Subgraph1") {
+          {
+            t {
+              id
+              ...OnT @include(if: $test1)
+              ...OnT @include(if: $test2)
+            }
+          }
+          
+          fragment OnT on T {
+            a
+            b
+          }
+        },
+      }
+    `);
+  });
+
+  it('do not try to apply fragments that are not valid for the subgaph', () => {
+    // Slightly artificial example for simplicity, but this highlight the problem.
+    // In that example, the only queried subgraph is the first one (there is in fact
+    // no way to ever reach the 2nd one), so the plan should mostly simply forward
+    // the query to the 1st subgraph, but a subtlety is that the named fragment used
+    // in the query is *not* valid for Subgraph1, because it queries `b` on `I`, but
+    // there is no `I.b` in Subgraph1.
+    // So including the named fragment in the fetch would be erroneous: the subgraph
+    // server would reject it when validating the query, and we must make sure it
+    // is not reused.
+    const subgraph1 = {
+      name: 'Subgraph1',
+      typeDefs: gql`
+        type Query {
+          i1: I
+          i2: I
+        }
+
+        interface I {
+          a: Int
+        }
+
+        type T implements I {
+          a: Int
+          b: Int
+        }
+      `
+    }
+
+    const subgraph2 = {
+      name: 'Subgraph2',
+      typeDefs: gql`
+        interface I {
+          a: Int
+          b: Int
+        }
+      `
+    }
+
+    const [api, queryPlanner] = composeAndCreatePlanner(subgraph1, subgraph2);
+    const operation = operationFromDocument(api, gql`
+      query {
+        i1 {
+          ... on T {
+            ...Frag
+          }
+        }
+        i2 {
+          ... on T {
+            ...Frag
+          }
+        }
+      }
+
+      fragment Frag on I {
+        b
+      }
+    `);
+
+    const plan = queryPlanner.buildQueryPlan(operation);
+    expect(plan).toMatchInlineSnapshot(`
+      QueryPlan {
+        Fetch(service: "Subgraph1") {
+          {
+            i1 {
+              __typename
+              ... on T {
+                b
+              }
+            }
+            i2 {
+              __typename
+              ... on T {
+                b
+              }
+            }
+          }
+        },
+      }
+    `);
+  });
 });
+
+test('works with key chains', () => {
+  const subgraph1 = {
+    name: 'Subgraph1',
+    typeDefs: gql`
+      type Query {
+        t: T
+      }
+
+      type T @key(fields: "id1") {
+        id1: ID!
+      }
+    `
+  }
+
+  const subgraph2 = {
+    name: 'Subgraph2',
+    typeDefs: gql`
+      type T @key(fields: "id1")  @key(fields: "id2") {
+        id1: ID!
+        id2: ID!
+      }
+    `
+  }
+
+  const subgraph3 = {
+    name: 'Subgraph3',
+    typeDefs: gql`
+      type T @key(fields: "id2") {
+        id2: ID!
+        x: Int
+        y: Int
+      }
+    `
+  }
+
+  const [api, queryPlanner] = composeAndCreatePlanner(subgraph1, subgraph2, subgraph3);
+  // Note: querying `id2` is only purpose, because there is 2 choice to get `id2` (either
+  // from then 2nd or 3rd subgraph), and that create some choice in the query planning algorithm,
+  // so excercices additional paths.
+  const operation = operationFromDocument(api, gql`
+    {
+      t {
+        id2
+        x
+        y
+      }
+    }
+  `);
+
+  const plan = queryPlanner.buildQueryPlan(operation);
+  expect(plan).toMatchInlineSnapshot(`
+    QueryPlan {
+      Sequence {
+        Fetch(service: "Subgraph1") {
+          {
+            t {
+              __typename
+              id1
+            }
+          }
+        },
+        Flatten(path: "t") {
+          Fetch(service: "Subgraph2") {
+            {
+              ... on T {
+                __typename
+                id1
+              }
+            } =>
+            {
+              ... on T {
+                id2
+              }
+            }
+          },
+        },
+        Flatten(path: "t") {
+          Fetch(service: "Subgraph3") {
+            {
+              ... on T {
+                __typename
+                id2
+              }
+            } =>
+            {
+              ... on T {
+                x
+                y
+              }
+            }
+          },
+        },
+      },
+    }
+  `);
+});
+
+describe('__typename handling', () => {
+  it('preservers aliased __typename', () => {
+    const subgraph1 = {
+      name: 'Subgraph1',
+      typeDefs: gql`
+        type Query {
+          t: T
+        }
+
+        type T @key(fields: "id") {
+          id: ID!
+          x: Int
+        }
+      `
+    }
+
+    const [api, queryPlanner] = composeAndCreatePlanner(subgraph1);
+    let operation = operationFromDocument(api, gql`
+      query {
+        t {
+          foo: __typename
+          x
+        }
+      }
+    `);
+
+    let plan = queryPlanner.buildQueryPlan(operation);
+    expect(plan).toMatchInlineSnapshot(`
+      QueryPlan {
+        Fetch(service: "Subgraph1") {
+          {
+            t {
+              foo: __typename
+              x
+            }
+          }
+        },
+      }
+    `);
+
+    operation = operationFromDocument(api, gql`
+      query {
+        t {
+          foo: __typename
+          x
+          __typename
+        }
+      }
+    `);
+
+    plan = queryPlanner.buildQueryPlan(operation);
+    expect(plan).toMatchInlineSnapshot(`
+      QueryPlan {
+        Fetch(service: "Subgraph1") {
+          {
+            t {
+              __typename
+              foo: __typename
+              x
+            }
+          }
+        },
+      }
+    `);
+  });
+
+  it('does not needlessly consider options for __typename', () => {
+    const subgraph1 = {
+      name: 'Subgraph1',
+      typeDefs: gql`
+        type Query {
+          s: S
+        }
+
+        type S @key(fields: "id") {
+          id: ID
+        }
+      `
+    }
+
+    const subgraph2 = {
+      name: 'Subgraph2',
+      typeDefs: gql`
+        type S @key(fields: "id") {
+          id: ID
+          t: T @shareable
+        }
+
+        type T @key(fields: "id") {
+          id: ID!
+          x: Int
+        }
+      `
+    }
+
+    const subgraph3 = {
+      name: 'Subgraph3',
+      typeDefs: gql`
+        type S @key(fields: "id") {
+          id: ID
+          t: T @shareable
+        }
+
+        type T @key(fields: "id") {
+          id: ID!
+          y: Int
+        }
+      `
+    }
+
+    const [api, queryPlanner] = composeAndCreatePlanner(subgraph1, subgraph2, subgraph3);
+    // This tests the patch from https://github.com/apollographql/federation/pull/2137.
+    // Namely, the schema is such that `x` can only be fetched from one subgraph, but
+    // technically __typename can be fetched from 2 subgraphs. However, the optimization
+    // we test for is that we actually don't consider both choices for __typename and
+    // instead only evaluate a single query plan (the assertion on `evaluatePlanCount`)
+    let operation = operationFromDocument(api, gql`
+      query {
+        s {
+          t {
+            __typename
+            x
+          }
+        }
+      }
+    `);
+
+    let plan = queryPlanner.buildQueryPlan(operation);
+    expect(queryPlanner.lastGeneratedPlanStatistics()?.evaluatedPlanCount).toBe(1);
+    expect(plan).toMatchInlineSnapshot(`
+      QueryPlan {
+        Sequence {
+          Fetch(service: "Subgraph1") {
+            {
+              s {
+                __typename
+                id
+              }
+            }
+          },
+          Flatten(path: "s") {
+            Fetch(service: "Subgraph2") {
+              {
+                ... on S {
+                  __typename
+                  id
+                }
+              } =>
+              {
+                ... on S {
+                  t {
+                    __typename
+                    x
+                  }
+                }
+              }
+            },
+          },
+        },
+      }
+    `);
+
+    // Almost the same test, but we artificially create a case where the result set
+    // for `s` has a __typename alongside just an inline fragments. This should
+    // change nothing to the example (the __typename on `s` is trivially fetched
+    // from the 1st subgraph and does not create new choices), but an early bug
+    // in the implementation made this example forgo the optimization of the
+    // __typename within `t`. We make sure this is not case (that we still only
+    // consider a single choice of plan).
+    operation = operationFromDocument(api, gql`
+      query {
+        s {
+          __typename
+          ... on S {
+            t {
+              __typename
+              x
+            }
+          }
+        }
+      }
+    `);
+
+    plan = queryPlanner.buildQueryPlan(operation);
+    expect(queryPlanner.lastGeneratedPlanStatistics()?.evaluatedPlanCount).toBe(1);
+    expect(plan).toMatchInlineSnapshot(`
+      QueryPlan {
+        Sequence {
+          Fetch(service: "Subgraph1") {
+            {
+              s {
+                __typename
+                id
+              }
+            }
+          },
+          Flatten(path: "s") {
+            Fetch(service: "Subgraph2") {
+              {
+                ... on S {
+                  __typename
+                  id
+                }
+              } =>
+              {
+                ... on S {
+                  t {
+                    __typename
+                    x
+                  }
+                }
+              }
+            },
+          },
+        },
+      }
+    `);
+  });
+});
+
+describe('mutations', () => {
+  it('executes mutation operations in sequence', () => {
+    const subgraph1 = {
+      name: 'Subgraph1',
+      typeDefs: gql`
+        type Query {
+          q1: Int
+        }
+
+        type Mutation {
+          m1: Int
+        }
+      `
+    }
+
+    const subgraph2 = {
+      name: 'Subgraph2',
+      typeDefs: gql`
+        type Mutation {
+          m2: Int
+        }
+      `
+    }
+
+    let [api, queryPlanner] = composeAndCreatePlanner(subgraph1, subgraph2);
+    let operation = operationFromDocument(api, gql`
+      mutation {
+        m2
+        m1
+      }
+    `);
+
+    let plan = queryPlanner.buildQueryPlan(operation);
+    expect(plan).toMatchInlineSnapshot(`
+      QueryPlan {
+        Sequence {
+          Fetch(service: "Subgraph2") {
+            {
+              m2
+            }
+          },
+          Fetch(service: "Subgraph1") {
+            {
+              m1
+            }
+          },
+        },
+      }
+    `);
+  });
+});
+
+describe('interface type-explosion', () => {
+  test('handles non-matching value types under interface field', () => {
+    const subgraph1 = {
+      name: 'Subgraph1',
+      typeDefs: gql`
+        type Query {
+          i: I
+        }
+
+        interface I {
+          s: S
+        }
+
+        type T implements I @key(fields: "id") {
+          id: ID!
+          s: S @shareable
+        }
+
+        type S @shareable {
+          x: Int
+        }
+      `
+    }
+
+    const subgraph2 = {
+      name: 'Subgraph2',
+      typeDefs: gql`
+        type T @key(fields: "id") {
+          id: ID!
+          s: S @shareable
+        }
+
+        type S @shareable {
+          x: Int
+          y: Int
+        }
+      `
+    }
+
+    const [api, queryPlanner] = composeAndCreatePlanner(subgraph1, subgraph2);
+    const operation = operationFromDocument(api, gql`
+      {
+        i {
+          s {
+            y
+          }
+        }
+      }
+    `);
+
+    // The schema is constructed in such a way that we *need* to type-explode interface `I`
+    // to be able to find field `y`. Make sure that happens.
+    const plan = queryPlanner.buildQueryPlan(operation);
+    expect(plan).toMatchInlineSnapshot(`
+      QueryPlan {
+        Sequence {
+          Fetch(service: "Subgraph1") {
+            {
+              i {
+                __typename
+                ... on T {
+                  __typename
+                  id
+                }
+              }
+            }
+          },
+          Flatten(path: "i") {
+            Fetch(service: "Subgraph2") {
+              {
+                ... on T {
+                  __typename
+                  id
+                }
+              } =>
+              {
+                ... on T {
+                  s {
+                    y
+                  }
+                }
+              }
+            },
+          },
+        },
+      }
+    `);
+  });
+
+  test('skip type-explosion early if unnecessary', () => {
+    const subgraph1 = {
+      name: 'Subgraph1',
+      typeDefs: gql`
+        type Query {
+          i: I
+        }
+
+        interface I {
+          s: S
+        }
+
+        type T implements I @key(fields: "id") {
+          id: ID!
+          s: S @shareable
+        }
+
+        type S @shareable {
+          x: Int
+          y: Int
+        }
+      `
+    }
+
+    const subgraph2 = {
+      name: 'Subgraph2',
+      typeDefs: gql`
+        type T @key(fields: "id") {
+          id: ID!
+          s: S @shareable
+        }
+
+        type S @shareable {
+          x: Int
+          y: Int
+        }
+      `
+    }
+
+    const [api, queryPlanner] = composeAndCreatePlanner(subgraph1, subgraph2);
+    const operation = operationFromDocument(api, gql`
+      {
+        i {
+          s {
+            y
+          }
+        }
+      }
+    `);
+
+    // This test is a small variation on the previous test ('handles non-matching ...'), we
+    // we _can_ use the interface field directly and don't need to type-explode. So we
+    // double-check that the plan indeed does not type-explode, but the true purpose of
+    // this test is to ensure the proper optimisation kicks in so that we do _not_ even
+    // evaluate the plan where we type explode. In other words, we ensure that the plan
+    // we get is the _only_ one evaluated.
+    const plan = queryPlanner.buildQueryPlan(operation);
+    expect(plan).toMatchInlineSnapshot(`
+      QueryPlan {
+        Fetch(service: "Subgraph1") {
+          {
+            i {
+              __typename
+              s {
+                y
+              }
+            }
+          }
+        },
+      }
+    `);
+    expect(queryPlanner.lastGeneratedPlanStatistics()?.evaluatedPlanCount).toBe(1);
+  });
+});
+
+/*
+ * Those tests the cases where 2 abstract types (interface or union) interact (having some common runtime
+ * types intersection), but one of them include an runtime type that the other also include _in the supergraph_
+ * but *not* in one of the subgraph. The tl;dr is that in some of those interaction, we must force a type-explosion
+ * to handle it properly, but no in other interactions, and this ensures this is handled properly.
+ */
+describe('merged abstract types handling', () => {
+  test('union/interface interaction', () => {
+    const subgraph1 = {
+      name: 'Subgraph1',
+      typeDefs: gql`
+        type Query {
+          u: U
+        }
+
+        union U = A | B | C
+
+        interface I {
+          v: Int
+        }
+
+        type A {
+          v: Int @shareable
+        }
+
+        type B implements I {
+          v: Int
+        }
+
+        type C implements I {
+          v: Int
+        }
+      `
+    }
+
+    const subgraph2 = {
+      name: 'Subgraph2',
+      typeDefs: gql`
+        interface I {
+          v: Int
+        }
+
+        type A implements I {
+          v: Int @shareable
+        }
+      `
+    }
+
+    const [api, queryPlanner] = composeAndCreatePlanner(subgraph1, subgraph2);
+    const operation = operationFromDocument(api, gql`
+      {
+        u {
+          ... on I {
+            v
+          }
+        }
+      }
+      `);
+
+    const plan = queryPlanner.buildQueryPlan(operation);
+    // Type `A` can be returned by `u` and is a `I` *in the supergraph* but not in `Subgraph1`, so need to
+    // type-explode `I` in the query to `Subgraph1` so it doesn't exclude `A`.
+    expect(plan).toMatchInlineSnapshot(`
+      QueryPlan {
+        Fetch(service: "Subgraph1") {
+          {
+            u {
+              __typename
+              ... on A {
+                v
+              }
+              ... on B {
+                v
+              }
+              ... on C {
+                v
+              }
+            }
+          }
+        },
+      }
+    `);
+  });
+
+  test('union/interface interaction, but no need to type-explode', () => {
+    const subgraph1 = {
+      name: 'Subgraph1',
+      typeDefs: gql`
+        type Query {
+          u: U
+        }
+
+        union U = B | C
+
+        interface I {
+          v: Int
+        }
+
+        type A implements I {
+          v: Int @shareable
+        }
+
+        type B implements I {
+          v: Int
+        }
+
+        type C implements I {
+          v: Int
+        }
+      `
+    }
+
+    const subgraph2 = {
+      name: 'Subgraph2',
+      typeDefs: gql`
+        union U = A
+
+        type A {
+          v: Int @shareable
+        }
+      `
+    }
+
+    const [api, queryPlanner] = composeAndCreatePlanner(subgraph1, subgraph2);
+    const operation = operationFromDocument(api, gql`
+      {
+        u {
+          ... on I {
+            v
+          }
+        }
+      }
+      `);
+
+    const plan = queryPlanner.buildQueryPlan(operation);
+    // While `A` is a `U` in the supergraph while not in `Subgraph1`, since the `u`
+    // operation is resolved by `Subgraph1`, it cannot ever return a A, and so
+    // there is need to type-explode `I` in this query.
+    expect(plan).toMatchInlineSnapshot(`
+      QueryPlan {
+        Fetch(service: "Subgraph1") {
+          {
+            u {
+              __typename
+              ... on I {
+                v
+              }
+            }
+          }
+        },
+      }
+    `);
+  });
+
+  test('interface/union interaction', () => {
+    const subgraph1 = {
+      name: 'Subgraph1',
+      typeDefs: gql`
+        type Query {
+          i: I
+        }
+
+        union U = B | C
+
+        interface I {
+          v: Int
+        }
+
+        type A implements I {
+          v: Int @shareable
+        }
+
+        type B implements I {
+          v: Int
+        }
+
+        type C implements I {
+          v: Int
+        }
+      `
+    }
+
+    const subgraph2 = {
+      name: 'Subgraph2',
+      typeDefs: gql`
+        union U = A
+
+        type A {
+          v: Int @shareable
+        }
+      `
+    }
+
+    const [api, queryPlanner] = composeAndCreatePlanner(subgraph1, subgraph2);
+    const operation = operationFromDocument(api, gql`
+      {
+        i {
+          ... on U {
+            ... on A {
+              v
+            }
+          }
+        }
+      }
+      `);
+
+    const plan = queryPlanner.buildQueryPlan(operation);
+    // Type `A` can be returned by `i` and is a `U` *in the supergraph* but not in `Subgraph1`, so need to
+    // type-explode `U` in the query to `Subgraph1` so it doesn't exclude `A`.
+    expect(plan).toMatchInlineSnapshot(`
+      QueryPlan {
+        Fetch(service: "Subgraph1") {
+          {
+            i {
+              __typename
+              ... on A {
+                v
+              }
+            }
+          }
+        },
+      }
+    `);
+  });
+
+  test('interface/union interaction, but no need to type-explode', () => {
+    const subgraph1 = {
+      name: 'Subgraph1',
+      typeDefs: gql`
+        type Query {
+          i: I
+        }
+
+        union U = A | B | C
+
+        interface I {
+          v: Int
+        }
+
+        type A {
+          v: Int @shareable
+        }
+
+        type B implements I {
+          v: Int
+        }
+
+        type C implements I {
+          v: Int
+        }
+      `
+    }
+
+    const subgraph2 = {
+      name: 'Subgraph2',
+      typeDefs: gql`
+        interface I {
+          v: Int
+        }
+
+        type A implements I {
+          v: Int @shareable
+        }
+      `
+    }
+
+    const [api, queryPlanner] = composeAndCreatePlanner(subgraph1, subgraph2);
+    const operation = operationFromDocument(api, gql`
+      {
+        i {
+          ... on U {
+            ... on A {
+              v
+            }
+          }
+        }
+      }
+      `);
+
+    const plan = queryPlanner.buildQueryPlan(operation);
+    // While `A` is a `I` in the supergraph while not in `Subgraph1`, since the `i` operation is resolved by
+    // `Subgraph1`, it cannot ever return a A, and so we should skip the whole `v` selection; or at the very
+    // least, we should not send a query with `... on U { ... on A { <stuff> }}` to `Subgraph1` since it
+    // would reject it as invalid.
+    expect(plan).toMatchInlineSnapshot(`
+      QueryPlan {
+        Fetch(service: "Subgraph1") {
+          {
+            i {
+              __typename
+            }
+          }
+        },
+      }
+    `);
+  });
+
+  test('interface/interface interaction', () => {
+    const subgraph1 = {
+      name: 'Subgraph1',
+      typeDefs: gql`
+        type Query {
+          i1: I1
+        }
+
+        interface I1 {
+          v: Int
+        }
+
+        interface I2 {
+          v: Int
+        }
+
+        type A implements I1 {
+          v: Int @shareable
+        }
+
+        type B implements I1 & I2 {
+          v: Int
+        }
+
+        type C implements I1 & I2 {
+          v: Int
+        }
+      `
+    }
+
+    const subgraph2 = {
+      name: 'Subgraph2',
+      typeDefs: gql`
+        interface I2 {
+          v: Int
+        }
+
+        type A implements I2 {
+          v: Int @shareable
+        }
+      `
+    }
+
+    const [api, queryPlanner] = composeAndCreatePlanner(subgraph1, subgraph2);
+    const operation = operationFromDocument(api, gql`
+      {
+        i1 {
+          ... on I2 {
+            v
+          }
+        }
+      }
+      `);
+
+    const plan = queryPlanner.buildQueryPlan(operation);
+    // Type `A` can be returned by `i1` and is a `I2` *in the supergraph* but not in `Subgraph1`, so need to
+    // type-explode `I2` in the query to `Subgraph1` so it doesn't exclude `A`.
+    expect(plan).toMatchInlineSnapshot(`
+      QueryPlan {
+        Fetch(service: "Subgraph1") {
+          {
+            i1 {
+              __typename
+              ... on A {
+                v
+              }
+              ... on B {
+                v
+              }
+              ... on C {
+                v
+              }
+            }
+          }
+        },
+      }
+    `);
+  });
+
+  test('interface/interface interaction, but no need to type-explode', () => {
+    const subgraph1 = {
+      name: 'Subgraph1',
+      typeDefs: gql`
+        type Query {
+          i1: I1
+        }
+
+        interface I1 {
+          v: Int
+        }
+
+        interface I2 {
+          v: Int
+        }
+
+        type A implements I2 {
+          v: Int @shareable
+        }
+
+        type B implements I1 & I2 {
+          v: Int
+        }
+
+        type C implements I1 & I2 {
+          v: Int
+        }
+      `
+    }
+
+    const subgraph2 = {
+      name: 'Subgraph2',
+      typeDefs: gql`
+        interface I1 {
+          v: Int
+        }
+
+        type A implements I1 {
+          v: Int @shareable
+        }
+      `
+    }
+
+    const [api, queryPlanner] = composeAndCreatePlanner(subgraph1, subgraph2);
+    const operation = operationFromDocument(api, gql`
+      {
+        i1 {
+          ... on I2 {
+            v
+          }
+        }
+      }
+      `);
+
+    const plan = queryPlanner.buildQueryPlan(operation);
+    // While `A` is a `I1` in the supergraph while not in `Subgraph1`, since the `i1`
+    // operation is resolved by `Subgraph1`, it cannot ever return a A, and so
+    // there is need to type-explode `I2` in this query (even if `Subgraph1` would
+    // otherwise not include `A` from a `... on I2`).
+    expect(plan).toMatchInlineSnapshot(`
+      QueryPlan {
+        Fetch(service: "Subgraph1") {
+          {
+            i1 {
+              __typename
+              ... on I2 {
+                v
+              }
+            }
+          }
+        },
+      }
+    `);
+  });
+
+  test('union/union interaction', () => {
+    const subgraph1 = {
+      name: 'Subgraph1',
+      typeDefs: gql`
+        type Query {
+          u1: U1
+        }
+
+        union U1 = A | B | C
+        union U2 = B | C
+
+        type A {
+          v: Int @shareable
+        }
+
+        type B {
+          v: Int
+        }
+
+        type C {
+          v: Int
+        }
+      `
+    }
+
+    const subgraph2 = {
+      name: 'Subgraph2',
+      typeDefs: gql`
+        union U2 = A
+
+        type A {
+          v: Int @shareable
+        }
+      `
+    }
+
+    const [api, queryPlanner] = composeAndCreatePlanner(subgraph1, subgraph2);
+    const operation = operationFromDocument(api, gql`
+      {
+        u1 {
+          ... on U2 {
+            ... on A {
+              v
+            }
+          }
+        }
+      }
+      `);
+
+    const plan = queryPlanner.buildQueryPlan(operation);
+    // Type `A` can be returned by `u1` and is a `U2` *in the supergraph* but not in `Subgraph1`, so need to
+    // type-explode `U2` in the query to `Subgraph1` so it doesn't exclude `A`.
+    expect(plan).toMatchInlineSnapshot(`
+      QueryPlan {
+        Fetch(service: "Subgraph1") {
+          {
+            u1 {
+              __typename
+              ... on A {
+                v
+              }
+            }
+          }
+        },
+      }
+    `);
+  });
+
+  test('union/union interaction, but no need to type-explode', () => {
+    const subgraph1 = {
+      name: 'Subgraph1',
+      typeDefs: gql`
+        type Query {
+          u1: U1
+        }
+
+        union U1 = B | C
+        union U2 = A | B | C
+
+        type A {
+          v: Int @shareable
+        }
+
+        type B {
+          v: Int
+        }
+
+        type C {
+          v: Int
+        }
+      `
+    }
+
+    const subgraph2 = {
+      name: 'Subgraph2',
+      typeDefs: gql`
+        union U1 = A
+
+        type A {
+          v: Int @shareable
+        }
+      `
+    }
+
+    const [api, queryPlanner] = composeAndCreatePlanner(subgraph1, subgraph2);
+    const operation = operationFromDocument(api, gql`
+      {
+        u1 {
+          ... on U2 {
+            ... on A {
+              v
+            }
+          }
+        }
+      }
+      `);
+
+    const plan = queryPlanner.buildQueryPlan(operation);
+    // While `A` is a `U1` in the supergraph while not in `Subgraph1`, since the `u1` operation is resolved by
+    // `Subgraph1`, it cannot ever return a A, and so we should skip the whole `v` selection; or at the very
+    // least, we should not send a query with `u1 { ... on A { <stuff> }}` to `Subgraph1` since it
+    // would reject it as invalid.
+    expect(plan).toMatchInlineSnapshot(`
+      QueryPlan {
+        Fetch(service: "Subgraph1") {
+          {
+            u1 {
+              __typename
+            }
+          }
+        },
+      }
+    `);
+  });
+});
+
+test('handles spread unions correctly', () => {
+  const subgraph1 = {
+    name: 'Subgraph1',
+    typeDefs: gql`
+      type Query {
+        u: U
+      }
+
+      union U = A | B
+
+      type A @key(fields: "id") {
+        id: ID!
+        a1: Int
+      }
+
+      type B {
+        id: ID!
+        b: Int
+      }
+
+      type C  @key(fields: "id") {
+        id: ID!
+        c1: Int
+      }
+    `
+  }
+
+  const subgraph2 = {
+    name: 'Subgraph2',
+    typeDefs: gql`
+      type Query {
+        otherQuery: U
+      }
+
+      union U = A | C
+
+      type A @key(fields: "id") {
+        id: ID!
+        a2: Int
+      }
+
+      type C @key(fields: "id") {
+        id: ID!
+        c2: Int
+      }
+    `
+  }
+
+  const [api, queryPlanner] = composeAndCreatePlanner(subgraph1, subgraph2);
+  const operation = operationFromDocument(api, gql`
+    {
+      u {
+        ... on C {
+          c1
+        }
+      }
+    }
+  `);
+
+  const plan = queryPlanner.buildQueryPlan(operation);
+  // Note: it's important that the query below DO NOT include the `... on C` part. Because in
+  // Subgraph 1, `C` is not a part of the union `U` and so a spread for `C` inside `u` is invalid
+  // GraphQL.
+  expect(plan).toMatchInlineSnapshot(`
+    QueryPlan {
+      Fetch(service: "Subgraph1") {
+        {
+          u {
+            __typename
+          }
+        }
+      },
+    }
+  `);
+})
